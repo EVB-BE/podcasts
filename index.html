@@ -172,14 +172,16 @@ async function getToken() {
   return store.get('access_token');
 }
 
+let quotaHit = false;
 async function api(path) {
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     const t = await getToken();
     if (!t) throw new Error('AUTH');
+    await sleep(400); // rustig tempo: hoogstens ongeveer 2 vragen per seconde
     const r = await fetch(API + path, { headers: { Authorization: 'Bearer ' + t } });
     if (r.status === 429) {
-      const wait = Number(r.headers.get('Retry-After')) || 3;
-      if (wait > 30) throw new Error('Spotify-limiet bereikt, probeer over ' + Math.ceil(wait / 60) + ' min. opnieuw');
+      const wait = Number(r.headers.get('Retry-After')) || 5;
+      if (wait > 30 || attempt === 2) { quotaHit = true; throw new Error('QUOTA'); }
       await sleep(wait * 1000);
       continue;
     }
@@ -214,20 +216,33 @@ async function latestEpisode(showId) {
   const total = first.total || 0;
 
   // Sommige series geven de oudste aflevering eerst, andere de nieuwste.
-  // Daarom altijd ook het einde van de lijst ophalen en de recentste datum nemen.
-  if (total > LIMIT) {
-    // Mag falen: dan blijft het resultaat van de eerste pagina gewoon behouden.
+  // De app onthoudt per serie welke volgorde Spotify gebruikt.
+  // Enkel voor series met de oudste eerst (of nog onbekend) wordt ook het einde van de lijst opgehaald.
+  const orders = readOrders();
+  const firstIds = new Set(eps.map(e => e.id));
+  let fetchedLast = false;
+  if (total > LIMIT && orders[showId] !== 'desc') {
     try {
       const last = await api(`/shows/${showId}/episodes?limit=${LIMIT}&offset=${total - LIMIT}&market=${MARKET}`);
       eps = eps.concat((last.items || []).filter(Boolean));
+      fetchedLast = true;
     } catch (e) {
-      if (e.message === 'AUTH') throw e;
+      if (e.message === 'AUTH' || e.message === 'QUOTA') throw e;
       lastErrors.push(e.message);
     }
   }
 
   eps.sort((a, b) => (b.release_date || '').localeCompare(a.release_date || ''));
-  return eps[0] || null;
+  const newest = eps[0] || null;
+  if (fetchedLast && newest) {
+    orders[showId] = firstIds.has(newest.id) ? 'desc' : 'asc';
+    store.set('orders', JSON.stringify(orders));
+  }
+  return newest;
+}
+
+function readOrders() {
+  try { return JSON.parse(store.get('orders') || '{}') || {}; } catch (e) { return {}; }
 }
 
 function statusOf(ep) {
@@ -261,13 +276,13 @@ async function pool(items, size, fn) {
 
 function footer() {
   return `<footer><button id="reset">Afmelden / opnieuw instellen</button>
-    <div class="status" style="padding:8px 0 0">Versie 4</div></footer>`;
+    <div class="status" style="padding:8px 0 0">Versie 5</div></footer>`;
 }
 function bindFooter() {
   const b = document.getElementById('reset');
   if (b) b.onclick = () => {
     if (!confirm('Afmelden en Client ID wissen?')) return;
-    ['access_token','refresh_token','expires_at','client_id','pkce_verifier','cache'].forEach(store.del);
+    ['access_token','refresh_token','expires_at','client_id','pkce_verifier','cache','orders'].forEach(store.del);
     showSetup();
   };
 }
@@ -307,29 +322,46 @@ async function refresh(force) {
   const cached = store.get('cache');
   if (cached) render(JSON.parse(cached), 'Bijwerken…');
   else app.innerHTML = `<div class="status">Podcasts ophalen…</div>`;
+  quotaHit = false;
+  const oldRows = {};
+  try { (JSON.parse(cached || '[]') || []).forEach(r => { oldRows[r.id] = r; }); } catch (e) {}
   try {
     const shows = await loadShows();
-    const rows = await pool(shows, 2, async s => {
-      let ep = null;
-      try { ep = await latestEpisode(s.id); }
-      catch (e) { if (e.message === 'AUTH') throw e; lastErrors.push(e.message); }
+    let done = 0;
+    const rows = await pool(shows, 1, async s => {
+      let ep = null, ok = false;
+      if (!quotaHit) {
+        try { ep = await latestEpisode(s.id); ok = true; }
+        catch (e) {
+          if (e.message === 'AUTH') throw e;
+          if (e.message !== 'QUOTA') lastErrors.push(e.message);
+        }
+      }
+      done++;
+      const st = app.querySelector('.status');
+      if (st && !quotaHit) st.textContent = `Bijwerken… ${done}/${shows.length}`;
       const imgs = s.images || [];
-      return {
+      const base = {
         id: s.id,
         name: s.name,
         url: (s.external_urls && s.external_urls.spotify) || `https://open.spotify.com/show/${s.id}`,
-        img: (imgs[imgs.length - 1] || imgs[0] || {}).url || '',
-        epName: ep ? ep.name : '',
-        epDate: ep ? ep.release_date : '',
-        status: statusOf(ep)
+        img: (imgs[imgs.length - 1] || imgs[0] || {}).url || ''
       };
+      // Niet opgehaald: laatst gekende gegevens van deze serie behouden.
+      if (!ok && oldRows[s.id]) {
+        const o = oldRows[s.id];
+        return { ...base, epName: o.epName, epDate: o.epDate, status: o.status };
+      }
+      return { ...base, epName: ep ? ep.name : '', epDate: ep ? ep.release_date : '', status: statusOf(ep) };
     });
     store.set('cache', JSON.stringify(rows));
-    render(rows, lastErrors.length
-      ? `${rows.length} podcasts · ${lastErrors.length} fouten bij ophalen · eerste fout: ${lastErrors[0]}`
-      : undefined);
+    let msg;
+    if (quotaHit) msg = `Spotify-limiet bereikt · niet alles is bijgewerkt · later opnieuw proberen`;
+    else if (lastErrors.length) msg = `${rows.length} podcasts · ${lastErrors.length} fouten · eerste fout: ${lastErrors[0]}`;
+    render(rows, msg);
   } catch (e) {
     if (e.message === 'AUTH') showLogin('Aanmelding verlopen, meld opnieuw aan.');
+    else if (e.message === 'QUOTA' && cached) render(JSON.parse(cached), 'Spotify-limiet bereikt · later opnieuw proberen');
     else if (cached) render(JSON.parse(cached), 'Bijwerken mislukt: ' + e.message);
     else app.innerHTML = `<div class="box"><p class="err">${esc(e.message)}</p></div>${footer()}`, bindFooter();
   } finally {
