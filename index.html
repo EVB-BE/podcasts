@@ -179,11 +179,16 @@ async function api(path) {
     const r = await fetch(API + path, { headers: { Authorization: 'Bearer ' + t } });
     if (r.status === 429) {
       const wait = Number(r.headers.get('Retry-After')) || 3;
+      if (wait > 30) throw new Error('Spotify-limiet bereikt, probeer over ' + Math.ceil(wait / 60) + ' min. opnieuw');
       await sleep(wait * 1000);
       continue;
     }
     if (r.status === 401) { store.del('access_token'); continue; }
-    if (!r.ok) throw new Error('Spotify gaf fout ' + r.status);
+    if (!r.ok) {
+      let detail = '';
+      try { const j = await r.json(); detail = (j.error && j.error.message) || ''; } catch (e) {}
+      throw new Error('Spotify gaf fout ' + r.status + (detail ? ' (' + detail + ')' : ''));
+    }
     return r.json();
   }
   throw new Error('Spotify reageert niet, probeer later opnieuw.');
@@ -211,8 +216,14 @@ async function latestEpisode(showId) {
   // Sommige series geven de oudste aflevering eerst, andere de nieuwste.
   // Daarom altijd ook het einde van de lijst ophalen en de recentste datum nemen.
   if (total > LIMIT) {
-    const last = await api(`/shows/${showId}/episodes?limit=${LIMIT}&offset=${total - LIMIT}&market=${MARKET}`);
-    eps = eps.concat((last.items || []).filter(Boolean));
+    // Mag falen: dan blijft het resultaat van de eerste pagina gewoon behouden.
+    try {
+      const last = await api(`/shows/${showId}/episodes?limit=${LIMIT}&offset=${total - LIMIT}&market=${MARKET}`);
+      eps = eps.concat((last.items || []).filter(Boolean));
+    } catch (e) {
+      if (e.message === 'AUTH') throw e;
+      lastErrors.push(e.message);
+    }
   }
 
   eps.sort((a, b) => (b.release_date || '').localeCompare(a.release_date || ''));
@@ -250,7 +261,7 @@ async function pool(items, size, fn) {
 
 function footer() {
   return `<footer><button id="reset">Afmelden / opnieuw instellen</button>
-    <div class="status" style="padding:8px 0 0">Versie 3</div></footer>`;
+    <div class="status" style="padding:8px 0 0">Versie 4</div></footer>`;
 }
 function bindFooter() {
   const b = document.getElementById('reset');
@@ -284,17 +295,24 @@ function render(rows, statusText) {
 }
 
 let busy = false;
-async function refresh() {
+let lastErrors = [];
+let lastRefresh = 0;
+async function refresh(force) {
   if (busy) return;
+  // Niet vaker dan om de 5 minuten automatisch bijwerken, om de Spotify-limiet te sparen.
+  if (!force && Date.now() - lastRefresh < 5 * 60 * 1000) return;
   busy = true;
+  lastRefresh = Date.now();
+  lastErrors = [];
   const cached = store.get('cache');
   if (cached) render(JSON.parse(cached), 'Bijwerken…');
   else app.innerHTML = `<div class="status">Podcasts ophalen…</div>`;
   try {
     const shows = await loadShows();
-    const rows = await pool(shows, 4, async s => {
+    const rows = await pool(shows, 2, async s => {
       let ep = null;
-      try { ep = await latestEpisode(s.id); } catch (e) { if (e.message === 'AUTH') throw e; }
+      try { ep = await latestEpisode(s.id); }
+      catch (e) { if (e.message === 'AUTH') throw e; lastErrors.push(e.message); }
       const imgs = s.images || [];
       return {
         id: s.id,
@@ -307,7 +325,9 @@ async function refresh() {
       };
     });
     store.set('cache', JSON.stringify(rows));
-    render(rows);
+    render(rows, lastErrors.length
+      ? `${rows.length} podcasts · ${lastErrors.length} fouten bij ophalen · eerste fout: ${lastErrors[0]}`
+      : undefined);
   } catch (e) {
     if (e.message === 'AUTH') showLogin('Aanmelding verlopen, meld opnieuw aan.');
     else if (cached) render(JSON.parse(cached), 'Bijwerken mislukt: ' + e.message);
@@ -317,7 +337,7 @@ async function refresh() {
   }
 }
 
-document.getElementById('refresh').onclick = refresh;
+document.getElementById('refresh').onclick = () => refresh(true);
 document.addEventListener('visibilitychange', () => { if (!document.hidden && store.get('refresh_token')) refresh(); });
 
 /* ---------- Start ---------- */
@@ -335,7 +355,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden && st
     history.replaceState(null, '', REDIRECT);
   }
   if (!(await getToken())) return showLogin();
-  refresh();
+  refresh(true);
 })();
 </script>
 </body>
