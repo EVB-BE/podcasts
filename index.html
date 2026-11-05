@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#121212">
+<title>Mijn podcasts</title>
+<style>
+  :root {
+    --bg: #121212;
+    --row: #1c1c1c;
+    --text: #ffffff;
+    --muted: #a7a7a7;
+    --line: #2a2a2a;
+    --blue: #3d91f4;
+    --green: #1ed760;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    position: sticky; top: 0; z-index: 2; background: var(--bg);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 16px 8px; border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 24px; margin: 0; }
+  .legend { color: var(--muted); font-size: 13px; padding: 8px 16px 4px; display: flex; gap: 16px; align-items: center; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  button {
+    font: inherit; color: var(--text); background: #2a2a2a; border: 0;
+    border-radius: 999px; padding: 10px 16px; cursor: pointer;
+  }
+  button.primary { background: var(--green); color: #000; font-weight: 600; }
+  #refresh { width: 44px; height: 44px; padding: 0; font-size: 20px; }
+  main { padding: 4px 0 40px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li a {
+    display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+    color: inherit; text-decoration: none; border-bottom: 1px solid var(--line);
+  }
+  li a:active { background: var(--row); }
+  img { width: 52px; height: 52px; border-radius: 6px; object-fit: cover; flex: none; background: #333; }
+  .info { flex: 1; min-width: 0; }
+  .name { font-size: 16px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub { font-size: 13px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dot { width: 14px; height: 14px; border-radius: 50%; flex: none; }
+  .dot.nieuw { background: var(--blue); }
+  .dot.bezig { border: 2px solid var(--blue); }
+  .dot.gehoord { background: transparent; }
+  .box { padding: 16px; line-height: 1.5; }
+  .box p { margin: 0 0 12px; }
+  .box input {
+    width: 100%; font: inherit; padding: 12px; border-radius: 8px;
+    border: 1px solid #444; background: #1c1c1c; color: var(--text); margin-bottom: 12px;
+  }
+  code { background: #222; padding: 2px 6px; border-radius: 4px; word-break: break-all; }
+  .status { color: var(--muted); font-size: 13px; padding: 8px 16px; }
+  .err { color: #ff6b6b; }
+  footer { padding: 24px 16px; }
+  footer button { background: transparent; color: var(--muted); padding: 0; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mijn podcasts</h1>
+  <button id="refresh" title="Vernieuwen" aria-label="Vernieuwen">↻</button>
+</header>
+<main id="app"></main>
+
+<script>
+const SCOPES = 'user-library-read user-read-playback-position';
+const REDIRECT = location.origin + location.pathname;
+const MARKET = 'BE';
+const API = 'https://api.spotify.com/v1';
+const TOKEN_URL = 'https://accounts.spotify.com/api/token';
+
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  del(k) { try { localStorage.removeItem(k); } catch (e) {} }
+};
+const app = document.getElementById('app');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+/* ---------- Instellen en aanmelden ---------- */
+
+function showSetup() {
+  app.innerHTML = `
+    <div class="box">
+      <p><strong>Eenmalig instellen</strong></p>
+      <p>1. Vul in het Spotify Developer Dashboard bij <em>Redirect URI</em> exact dit adres in:</p>
+      <p><code>${esc(REDIRECT)}</code></p>
+      <p>2. Plak hieronder de <em>Client ID</em> van de Spotify-app.</p>
+      <input id="cid" placeholder="Client ID" autocomplete="off" spellcheck="false">
+      <button class="primary" id="save">Opslaan en aanmelden</button>
+    </div>`;
+  document.getElementById('save').onclick = () => {
+    const v = document.getElementById('cid').value.trim();
+    if (!v) return;
+    store.set('client_id', v);
+    login();
+  };
+}
+
+function showLogin(msg) {
+  app.innerHTML = `
+    <div class="box">
+      ${msg ? `<p class="err">${esc(msg)}</p>` : ''}
+      <p>Aanmelden bij Spotify om de gevolgde podcasts op te halen.</p>
+      <button class="primary" id="login">Aanmelden bij Spotify</button>
+    </div>${footer()}`;
+  document.getElementById('login').onclick = login;
+  bindFooter();
+}
+
+async function login() {
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(64)));
+  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  store.set('pkce_verifier', verifier);
+  const p = new URLSearchParams({
+    client_id: store.get('client_id'),
+    response_type: 'code',
+    redirect_uri: REDIRECT,
+    scope: SCOPES,
+    code_challenge_method: 'S256',
+    code_challenge: challenge
+  });
+  location.href = 'https://accounts.spotify.com/authorize?' + p;
+}
+
+function saveToken(j) {
+  store.set('access_token', j.access_token);
+  store.set('expires_at', String(Date.now() + (j.expires_in - 60) * 1000));
+  if (j.refresh_token) store.set('refresh_token', j.refresh_token);
+}
+
+async function exchangeCode(code) {
+  const r = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: store.get('client_id'),
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: REDIRECT,
+      code_verifier: store.get('pkce_verifier') || ''
+    })
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error_description || j.error || 'Aanmelden mislukt');
+  saveToken(j);
+}
+
+async function getToken() {
+  const at = store.get('access_token');
+  if (at && Date.now() < Number(store.get('expires_at'))) return at;
+  const rt = store.get('refresh_token');
+  if (!rt) return null;
+  const r = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: store.get('client_id'), grant_type: 'refresh_token', refresh_token: rt })
+  });
+  if (!r.ok) { store.del('refresh_token'); store.del('access_token'); return null; }
+  saveToken(await r.json());
+  return store.get('access_token');
+}
+
+async function api(path) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const t = await getToken();
+    if (!t) throw new Error('AUTH');
+    const r = await fetch(API + path, { headers: { Authorization: 'Bearer ' + t } });
+    if (r.status === 429) {
+      const wait = Number(r.headers.get('Retry-After')) || 3;
+      await sleep(wait * 1000);
+      continue;
+    }
+    if (r.status === 401) { store.del('access_token'); continue; }
+    if (!r.ok) throw new Error('Spotify gaf fout ' + r.status);
+    return r.json();
+  }
+  throw new Error('Spotify reageert niet, probeer later opnieuw.');
+}
+
+/* ---------- Gegevens ophalen ---------- */
+
+async function loadShows() {
+  const shows = [];
+  let path = '/me/shows?limit=50';
+  while (path) {
+    const j = await api(path);
+    shows.push(...j.items.map(i => i.show).filter(Boolean));
+    path = j.next ? j.next.replace(API, '') : null;
+  }
+  return shows;
+}
+
+async function latestEpisode(showId) {
+  const j = await api(`/shows/${showId}/episodes?limit=5&market=${MARKET}`);
+  const eps = (j.items || []).filter(Boolean)
+    .sort((a, b) => (b.release_date || '').localeCompare(a.release_date || ''));
+  return eps[0] || null;
+}
+
+function statusOf(ep) {
+  if (!ep) return 'gehoord';
+  const rp = ep.resume_point || {};
+  if (rp.fully_played) return 'gehoord';
+  if (rp.resume_position_ms > 0) return 'bezig';
+  return 'nieuw';
+}
+
+function fmtDate(d) {
+  if (!d) return '';
+  const dt = new Date(d + (d.length === 10 ? 'T12:00:00' : ''));
+  if (isNaN(dt)) return d;
+  const opts = { day: 'numeric', month: 'short' };
+  if (dt.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+  return dt.toLocaleDateString('nl-BE', opts);
+}
+
+async function pool(items, size, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  async function worker() {
+    while (i < items.length) { const n = i++; out[n] = await fn(items[n], n); }
+  }
+  await Promise.all(Array.from({ length: size }, worker));
+  return out;
+}
+
+/* ---------- Weergave ---------- */
+
+function footer() {
+  return `<footer><button id="reset">Afmelden / opnieuw instellen</button></footer>`;
+}
+function bindFooter() {
+  const b = document.getElementById('reset');
+  if (b) b.onclick = () => {
+    if (!confirm('Afmelden en Client ID wissen?')) return;
+    ['access_token','refresh_token','expires_at','client_id','pkce_verifier','cache'].forEach(store.del);
+    showSetup();
+  };
+}
+
+function render(rows, statusText) {
+  const sorted = [...rows].sort((a, b) => a.name.localeCompare(b.name, 'nl', { sensitivity: 'base' }));
+  const nNew = sorted.filter(r => r.status === 'nieuw').length;
+  app.innerHTML = `
+    <div class="legend">
+      <span><i class="dot nieuw"></i> nieuwe aflevering</span>
+      <span><i class="dot bezig"></i> bezig</span>
+    </div>
+    <div class="status">${esc(statusText || `${sorted.length} podcasts · ${nNew} met nieuwe aflevering`)}</div>
+    <ul>${sorted.map(r => `
+      <li><a href="${esc(r.url)}">
+        <img src="${esc(r.img)}" alt="" loading="lazy">
+        <div class="info">
+          <div class="name">${esc(r.name)}</div>
+          <div class="sub">${r.epDate ? 'Laatste: ' + esc(fmtDate(r.epDate)) + ' · ' : ''}${esc(r.epName || '')}</div>
+        </div>
+        <i class="dot ${r.status}" aria-label="${r.status}"></i>
+      </a></li>`).join('')}
+    </ul>${footer()}`;
+  bindFooter();
+}
+
+let busy = false;
+async function refresh() {
+  if (busy) return;
+  busy = true;
+  const cached = store.get('cache');
+  if (cached) render(JSON.parse(cached), 'Bijwerken…');
+  else app.innerHTML = `<div class="status">Podcasts ophalen…</div>`;
+  try {
+    const shows = await loadShows();
+    const rows = await pool(shows, 4, async s => {
+      let ep = null;
+      try { ep = await latestEpisode(s.id); } catch (e) { if (e.message === 'AUTH') throw e; }
+      const imgs = s.images || [];
+      return {
+        id: s.id,
+        name: s.name,
+        url: (s.external_urls && s.external_urls.spotify) || `https://open.spotify.com/show/${s.id}`,
+        img: (imgs[imgs.length - 1] || imgs[0] || {}).url || '',
+        epName: ep ? ep.name : '',
+        epDate: ep ? ep.release_date : '',
+        status: statusOf(ep)
+      };
+    });
+    store.set('cache', JSON.stringify(rows));
+    render(rows);
+  } catch (e) {
+    if (e.message === 'AUTH') showLogin('Aanmelding verlopen, meld opnieuw aan.');
+    else if (cached) render(JSON.parse(cached), 'Bijwerken mislukt: ' + e.message);
+    else app.innerHTML = `<div class="box"><p class="err">${esc(e.message)}</p></div>${footer()}`, bindFooter();
+  } finally {
+    busy = false;
+  }
+}
+
+document.getElementById('refresh').onclick = refresh;
+document.addEventListener('visibilitychange', () => { if (!document.hidden && store.get('refresh_token')) refresh(); });
+
+/* ---------- Start ---------- */
+
+(async function start() {
+  const q = new URLSearchParams(location.search);
+  if (!store.get('client_id')) return showSetup();
+  if (q.get('error')) {
+    history.replaceState(null, '', REDIRECT);
+    return showLogin('Aanmelden geweigerd of mislukt (' + q.get('error') + ').');
+  }
+  if (q.get('code')) {
+    try { await exchangeCode(q.get('code')); }
+    catch (e) { history.replaceState(null, '', REDIRECT); return showLogin(e.message); }
+    history.replaceState(null, '', REDIRECT);
+  }
+  if (!(await getToken())) return showLogin();
+  refresh();
+})();
+</script>
+</body>
+</html>
