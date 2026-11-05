@@ -203,9 +203,21 @@ async function loadShows() {
 }
 
 async function latestEpisode(showId) {
-  const j = await api(`/shows/${showId}/episodes?limit=5&market=${MARKET}`);
-  const eps = (j.items || []).filter(Boolean)
-    .sort((a, b) => (b.release_date || '').localeCompare(a.release_date || ''));
+  const LIMIT = 10;
+  const first = await api(`/shows/${showId}/episodes?limit=${LIMIT}&market=${MARKET}`);
+  let eps = (first.items || []).filter(Boolean);
+  const total = first.total || 0;
+
+  // Reeksen met seizoenen geven de oudste aflevering eerst.
+  // Dan staat de nieuwste aflevering op het einde van de lijst: die pagina ook ophalen.
+  const dates = eps.map(e => e.release_date || '');
+  const ascending = dates.length > 1 && dates[0] < dates[dates.length - 1];
+  if (total > LIMIT && ascending) {
+    const last = await api(`/shows/${showId}/episodes?limit=${LIMIT}&offset=${total - LIMIT}&market=${MARKET}`);
+    eps = eps.concat((last.items || []).filter(Boolean));
+  }
+
+  eps.sort((a, b) => (b.release_date || '').localeCompare(a.release_date || ''));
   return eps[0] || null;
 }
 
